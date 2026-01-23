@@ -10345,14 +10345,58 @@ int wifi_drv_probe_req_report(void *priv, int report)
 
 int wifi_drv_cancel_remain_on_channel(void *priv)
 {
-    wifi_hal_dbg_print("%s:%d: Enter\n", __func__, __LINE__);
-    return 0;
+    wifi_interface_info_t *interface = (wifi_interface_info_t *)priv;
+    struct nl_msg *msg;
+    int ret;
+
+    msg = nl80211_drv_cmd_msg(g_wifi_hal.nl80211_id, interface, 0,
+                              NL80211_CMD_CANCEL_REMAIN_ON_CHANNEL);
+    if (!msg)
+        return -1;
+
+    wifi_hal_info_print("%s:%d: Send Cancel ROC on %s\n",
+        __func__, __LINE__, interface->name);
+
+    ret = nl80211_send_and_recv(msg, NULL, NULL, NULL, NULL);
+    interface->pending_remain_on_chan = 0;
+
+    return ret;
 }
 
 int wifi_drv_remain_on_channel(void *priv, unsigned int freq, unsigned int duration)
 {
-    wifi_hal_dbg_print("%s:%d: Enter\n", __func__, __LINE__);
-    return 0;
+    wifi_interface_info_t *interface = (wifi_interface_info_t *)priv;
+    struct nl_msg *msg;
+    u64 cookie;
+    int ret;
+
+    wifi_hal_info_print("%s:%d: ROC request freq=%u duration=%u on %s\n",
+                       __func__, __LINE__, freq, duration, interface->name);
+
+    msg = nl80211_drv_cmd_msg(g_wifi_hal.nl80211_id, interface, 0,
+                              NL80211_CMD_REMAIN_ON_CHANNEL);
+    if (!msg)
+        return -1;
+
+    if (nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freq) ||
+        nla_put_u32(msg, NL80211_ATTR_DURATION, duration)) {
+        nlmsg_free(msg);
+        return -1;
+    }
+
+    cookie = 0;
+    ret = nl80211_send_and_recv(msg, cookie_handler, &cookie, NULL, NULL);
+
+    if (ret == 0) {
+        wifi_hal_info_print("%s:%d: ROC started on freq=%u, cookie=%llu\n",
+                            __func__, __LINE__, freq, cookie);
+        interface->pending_remain_on_chan = 1;
+    } else {
+        wifi_hal_error_print("%s:%d: ROC failed ret=%d (%s)\n",
+                            __func__, __LINE__, ret, strerror(-ret));
+    }
+
+    return ret;
 }
 
 void wifi_drv_send_action_cancel_wait(void *priv)
@@ -10567,10 +10611,29 @@ int wifi_drv_send_mlme(void *priv, const u8 *data,
                 to_mac_str(mgmt->da, dst_mac_str), le_to_host16(mgmt->u.deauth.reason_code));
             break;
         case WLAN_FC_STYPE_ACTION:
-            wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s cat:%d\n",
-                __func__, __LINE__, interface->name, to_mac_str(mgmt->sa, src_mac_str),
-                to_mac_str(mgmt->da, dst_mac_str), mgmt->u.action.category);
-            break;
+            wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s beacon_set:%d cat:%d type:%d ssid:%s\n",
+                __func__, __LINE__, interface->name, to_mac_str(mgmt->sa, src_mac_str), to_mac_str(mgmt->da, dst_mac_str),
+                interface->beacon_set, mgmt->u.action.category, interface->type, interface->u.sta.backhaul.ssid);
+            if(interface->type != NL80211_IFTYPE_AP && strlen(interface->u.sta.backhaul.ssid) == 0) {
+                wifi_hal_info_print("%s:%d: interface:%s not connected\n", __FUNCTION__, __LINE__, interface->name);
+                // Before sending presence announcement on each freq:
+                // 1. Start ROC
+                wifi_drv_remain_on_channel(interface, freq, 1000);
+                // 2. Wait briefly for ROC to establish
+                usleep(100000);
+                // 3. Send frame with freq=0 (use current channel)
+                res = nl80211_send_frame_cmd(interface, 0, wait, data, data_len, use_cookie, 0,
+                    noack, csa_offs, csa_offs_len, link_id);
+                if(res < 0) {
+                    wifi_hal_error_print("%s:%d: Failed to send frame: ret=%d (%s)\n", __FUNCTION__, __LINE__, res, strerror(-res));
+                }
+                // 4. Wait for dwell
+                usleep(100000);
+                // 5. Cancel ROC (or let it expire)
+                wifi_drv_cancel_remain_on_channel(interface);
+            }
+        }
+        break;
         }
     }
 

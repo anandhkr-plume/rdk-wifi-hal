@@ -12029,7 +12029,7 @@ int wifi_drv_send_mlme(void *priv, const u8 *data,
     unsigned int wait = 0;
 #endif
     int res, interface_freq;
-    mac_addr_str_t src_mac_str, dst_mac_str;
+    mac_addr_str_t src_mac_str, dst_mac_str, bssid_str;
     int offchanok = 1;
 #if HOSTAPD_VERSION < 211 // 2.11
     int link_id = -1;
@@ -12091,9 +12091,16 @@ int wifi_drv_send_mlme(void *priv, const u8 *data,
                 to_mac_str(mgmt->da, dst_mac_str), le_to_host16(mgmt->u.deauth.reason_code));
             break;
         case WLAN_FC_STYPE_ACTION:
-            wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s cat:%d\n",
+            wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s bssid:%s cat:%d bss_tm_req:%d \n",
                 __func__, __LINE__, interface->name, to_mac_str(mgmt->sa, src_mac_str),
-                to_mac_str(mgmt->da, dst_mac_str), mgmt->u.action.category);
+             to_mac_str(mgmt->da, dst_mac_str), to_mac_str(mgmt->bssid, bssid_str), mgmt->u.action.category, mgmt->u.action.u.bss_tm_req.action);
+
+            if(mgmt->u.action.u.bss_tm_req.action == WNM_BSS_TRANS_MGMT_REQ) {
+                memcpy(mgmt->bssid, interface->mac, ETH_ALEN);
+                wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s bssid:%s cat:%d bss_tm_req:%d \n",
+                    __func__, __LINE__, interface->name, to_mac_str(mgmt->sa, src_mac_str),
+                 to_mac_str(mgmt->da, dst_mac_str), to_mac_str(mgmt->bssid, bssid_str), mgmt->u.action.category, mgmt->u.action.u.bss_tm_req.action);    
+            }
             break;
         }
     }

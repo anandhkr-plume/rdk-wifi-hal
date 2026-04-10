@@ -12732,6 +12732,14 @@ int wifi_drv_send_mlme(void *priv, const u8 *data,
 
             if(mgmt->u.action.u.bss_tm_req.action == WNM_BSS_TRANS_MGMT_REQ) {
                 memcpy(mgmt->bssid, interface->mac, ETH_ALEN);
+#ifdef CONFIG_GENERIC_MLO
+                if (link_id == -1 && wifi_hal_is_mld_enabled(interface)) {
+                    link_id = wifi_hal_get_mld_link_id(interface);
+                }
+#endif
+                if (link_id != -1) {
+                    memcpy(mgmt->sa, interface->vap_info.u.bss_info.mld_info.common_info.mld_addr, ETH_ALEN);
+                }
                 wifi_hal_dbg_print("%s:%d: interface:%s send action frame from:%s to:%s bssid:%s cat:%d bss_tm_req:%d \n",
                     __func__, __LINE__, interface->name, to_mac_str(mgmt->sa, src_mac_str),
                  to_mac_str(mgmt->da, dst_mac_str), to_mac_str(mgmt->bssid, bssid_str), mgmt->u.action.category, mgmt->u.action.u.bss_tm_req.action);    

@@ -417,6 +417,9 @@ INT wifi_hal_init()
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211) && defined(CONFIG_WIFI_EMULATOR_EXT_AGENT)
     void supplicant_event(void *ctx, enum wpa_event_type event, union wpa_event_data *data);
     wpa_supplicant_event = supplicant_event;
+#elif defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
+    void hostapd_wpa_event(void *ctx, enum wpa_event_type event, union wpa_event_data *data);
+    wpa_supplicant_event = hostapd_wpa_event;
 #endif // BANANA_PI_PORT
     if ((drv_name = get_wifi_drv_name()) == NULL) {
         wifi_hal_error_print("%s:%d: driver not found, get drv name failed\n", __func__, __LINE__);
@@ -508,6 +511,7 @@ INT wifi_hal_init()
 
 #if defined(CONFIG_HW_CAPABILITIES) || defined(VNTXER5_PORT) || defined(TARGET_GEMINI7_2)
     for (i = 0; i < g_wifi_hal.num_radios; i++) {
+        wifi_interface_info_t *first_ap_interface = NULL;
         wifi_interface_info_t *interface;
         radio = get_radio_by_rdk_index(i);
         update_hostap_config_params(radio);
@@ -518,8 +522,26 @@ INT wifi_hal_init()
                 update_hostap_iface(interface);
                 update_hostap_iface_flags(interface);
                 init_hostap_hw_features(interface);
+		        if (first_ap_interface == NULL) {
+                    first_ap_interface = interface;
+                    wifi_hal_dbg_print("%s:%d: Saved first AP interface %s for radio %u\n",
+                                       __func__, __LINE__, interface->name, i);
+                }
             }
             interface = hash_map_get_next(radio->interface_map, interface);
+        }
+        if (first_ap_interface != NULL) {
+            struct hostapd_iface *iface = &first_ap_interface->u.ap.iface;
+            if (iface->num_hw_features > 0) {
+                wifi_hal_dbg_print("%s:%d: Copying hw_features to radio->hw_modes for radio %u:%d\n",
+                                   __func__, __LINE__, i, radio->rdk_radio_index);
+                copy_hw_features_to_radio_hw_modes(radio, iface);
+            } else {
+                wifi_hal_dbg_print("%s:%d: No hw_features found for radio %u (num_hw_features=%u)\n",
+                                   __func__, __LINE__, i, iface->num_hw_features);
+            }
+        } else {
+            wifi_hal_dbg_print("%s:%d: No AP interface found for radio %u\n", __func__, __LINE__, i);
         }
     }
 #endif // CONFIG_HW_CAPABILITIES || VNTXER5_PORT || TARGET_GEMINI7_2
@@ -554,12 +576,6 @@ INT wifi_hal_pre_init()
         wifi_hal_info_print("%s:%d: platfrom pre init\n", __func__, __LINE__);
         pre_init_fn();
     }
-
-#if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
-    void hostapd_wpa_event(void *ctx, enum wpa_event_type event, union wpa_event_data *data);
-
-    wpa_supplicant_event = hostapd_wpa_event;
-#endif // BANANA_PI_PORT
 
     return RETURN_OK;
 }
@@ -2573,6 +2589,34 @@ INT wifi_hal_sendDataFrame( int vap_id, unsigned char *dmac, unsigned char *data
     return RETURN_ERR;
 }
 
+#ifndef FEATURE_SINGLE_PHY
+void wifi_hal_rnr_init(wifi_radio_index_t radio_index, const char *ssid)
+{
+    wifi_radio_info_t *radio = get_radio_by_rdk_index(radio_index);
+
+    if (radio == NULL) {
+        wifi_hal_error_print("%s:%d: [RNR] invalid radio_index=%d\n", __func__, __LINE__,
+            radio_index);
+        return;
+    }
+
+    memset(&radio->rnr, 0, sizeof(radio->rnr));
+    radio->rnr_enabled = false;
+
+    if (ssid != NULL && ssid[0] != '\0') {
+        radio->rnr.ssid_crc = rnr_crc32((const uint8_t *)ssid, strlen(ssid));
+        radio->rnr.have_ssid = true;
+        strncpy(radio->rnr.ssid, ssid, sizeof(radio->rnr.ssid) - 1);
+        wifi_hal_dbg_print("%s:%d: [RNR] init radio=%d ssid=\"%s\" "
+                           "crc=0x%08X\n",
+            __func__, __LINE__, radio_index, radio->rnr.ssid, radio->rnr.ssid_crc);
+    } else {
+        radio->rnr.have_ssid = false;
+        wifi_hal_dbg_print("%s:%d: [RNR] init radio=%d no ssid\n", __func__, __LINE__, radio_index);
+    }
+}
+#endif // FEATURE_SINGLE_PHY
+
 INT wifi_hal_startScan(wifi_radio_index_t index, wifi_neighborScanMode_t scan_mode, INT dwell_time, UINT num, UINT *chan_list)
 {
     wifi_radio_info_t *radio;
@@ -2598,7 +2642,7 @@ INT wifi_hal_startScan(wifi_radio_index_t index, wifi_neighborScanMode_t scan_mo
     radio = get_radio_by_rdk_index(index);
     if (radio == NULL) {
         wifi_hal_stats_error_print("%s:%d:Could not find radio for index: %d\n", __func__, __LINE__, index);
-        return RETURN_ERR; 
+        return RETURN_ERR;
     }
 
     interface = hash_map_get_first(radio->interface_map);
@@ -2687,7 +2731,16 @@ INT wifi_hal_startScan(wifi_radio_index_t index, wifi_neighborScanMode_t scan_mo
     hash_map_cleanup(interface->scan_info_map);
     pthread_mutex_unlock(&interface->scan_info_mutex);
 
-    return (nl80211_start_scan(interface, NL80211_SCAN_FLAG_COLOCATED_6GHZ, freq_num, freq_list, dwell_time, 1, ssid_list) == 0) ? RETURN_OK:RETURN_ERR;
+#ifndef FEATURE_SINGLE_PHY
+    for (unsigned int r = 0; r < g_wifi_hal.num_radios; r++) {
+        if (g_wifi_hal.radio_info[r].oper_param.band == WIFI_FREQUENCY_6_BAND) {
+            radio->rnr_enabled = true;
+            break;
+        }
+    }
+#endif //FEATURE_SINGLE_PHY
+
+    return (nl80211_start_scan(interface, NL80211_SCAN_FLAG_COLOCATED_6GHZ | NL80211_SCAN_FLAG_FLUSH, freq_num, freq_list, dwell_time, 1, ssid_list) == 0) ? RETURN_OK:RETURN_ERR;
 }
 
 /*****************************/
@@ -4528,6 +4581,20 @@ void wifi_hal_apDisassociatedDevice_callback_register(wifi_device_disassociated_
 
     callbacks->disassoc_cb[callbacks->num_disassoc_cbs] = func;
     callbacks->num_disassoc_cbs++;
+}
+
+void wifi_hal_handshake_callback_register(wifi_handshake_callback func)
+{
+    wifi_device_callbacks_t *callbacks;
+
+    callbacks = get_hal_device_callbacks();
+    
+    if (callbacks == NULL || callbacks->num_handshake_cbs >= MAX_REGISTERED_CB_NUM) {
+        return;
+    }
+    
+    callbacks->handshake_cb[callbacks->num_handshake_cbs] = func;
+    callbacks->num_handshake_cbs++;
 }
 
 void wifi_hal_stamode_callback_register(wifi_stamode_callback func)
